@@ -1,0 +1,23 @@
+// 値の独立性と、「値を変えたいときは入れ直す」書き方
+type User {
+    name string
+    age int
+}
+
+func birthday(user User) User {
+    user.age += 1
+    return user
+}
+
+func greet(user User) {
+    print("やあ、{user.name}（{user.age}歳）")
+}
+
+a = User("ようかん", 7)
+b = a
+b.age = 8
+print(a.age, b.age)
+
+a = birthday(a)
+a.greet()     // greet(a) と同じ
+greet(b)

@@ -1,0 +1,8 @@
+// 九九の表
+for a in 1..9 {
+    line = ""
+    for b in 1..9 {
+        line += "{a * b} "
+    }
+    print(line)
+}

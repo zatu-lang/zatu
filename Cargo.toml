@@ -1,0 +1,9 @@
+[package]
+name = "zatu"
+version = "0.0.1"
+edition = "2024"
+description = "雑に書けば、動く。"
+
+[dependencies]
+unicode-segmentation = "1"
+unicode-width = "0.2"

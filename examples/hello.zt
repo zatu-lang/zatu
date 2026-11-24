@@ -1,0 +1,6 @@
+name = "ようかん"
+age = 7
+
+print("こんにちは、{name}！")
+print("{name}は{age}歳です")
+print("「{name}」は {len(name)} 文字")

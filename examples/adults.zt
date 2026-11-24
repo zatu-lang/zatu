@@ -1,0 +1,18 @@
+// 言語設計.md §2.2 の例
+type User {
+    name string
+    age int
+}
+
+users = [User("ようかん", 7), User("たろう", 20), User("はなこ", 18)]
+
+adults = []
+for user in users {
+    if user.age >= 18 {
+        adults += user
+    }
+}
+
+for user at i in adults {
+    print("{i}: {user.name}")
+}

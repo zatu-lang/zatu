@@ -1,0 +1,17 @@
+// 数当てゲーム
+answer = random(1, 100)
+count = 0
+
+print("1 から 100 までの数を当ててね")
+for {
+    guess = int(input("> "))
+    count += 1
+    if guess == answer {
+        print("あたり！ {count} 回で当たったよ")
+        break
+    } else if guess < answer {
+        print("もっと大きい")
+    } else {
+        print("もっと小さい")
+    }
+}
