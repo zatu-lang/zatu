@@ -1,5 +1,7 @@
 // 構文木（AST）の定義
 
+use std::collections::HashMap;
+
 /// ソースコード上の位置。col と len は文字単位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
@@ -36,6 +38,13 @@ impl TypeExpr {
             TypeExpr::Array(t) => format!("[]{}", t.show()),
         }
     }
+
+    pub(crate) fn element(&self) -> Option<&Self> {
+        match self {
+            Self::Array(ty) => Some(ty),
+            Self::Named(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +78,9 @@ pub struct TypeDecl {
     pub fields: Vec<Param>,
 }
 
+pub(crate) type TypeDecls<'a> = HashMap<&'a str, &'a TypeDecl>;
+pub(crate) type VariableTypes<'a> = HashMap<&'a str, &'a TypeExpr>;
+
 #[derive(Debug)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -100,6 +112,7 @@ pub struct Target {
 pub enum StmtKind {
     Assign {
         target: Target,
+        annotation: Option<(TypeExpr, Span)>,
         op: AssignOp,
         value: Expr,
     },
@@ -124,6 +137,53 @@ pub enum StmtKind {
     Return(Option<Expr>),
     Break,
     Continue,
+}
+
+/// 型注釈は変数と同じく、トップレベルまたは関数全体に効く。
+pub(crate) fn variable_types(stmts: &[Stmt]) -> VariableTypes<'_> {
+    fn collect<'a>(stmts: &'a [Stmt], types: &mut VariableTypes<'a>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                StmtKind::Assign { target, annotation: Some((ty, _)), .. } => {
+                    types.entry(&target.name).or_insert(ty);
+                }
+                StmtKind::If { then, els, .. } => {
+                    collect(then, types);
+                    if let Some(els) = els {
+                        collect(els, types);
+                    }
+                }
+                StmtKind::ForIn { body, .. } | StmtKind::While { body, .. } => collect(body, types),
+                _ => {}
+            }
+        }
+    }
+    let mut types = HashMap::new();
+    collect(stmts, &mut types);
+    types
+}
+
+pub(crate) fn assignment_value_type<'a>(
+    target: &Target,
+    op: AssignOp,
+    vars: &VariableTypes<'a>,
+    types: &TypeDecls<'a>,
+) -> Option<&'a TypeExpr> {
+    let mut ty = *vars.get(target.name.as_str())?;
+    for access in &target.path {
+        ty = match (access, ty) {
+            (Access::Index(_), TypeExpr::Array(inner)) => inner,
+            (Access::Field(name, _), TypeExpr::Named(ty_name)) => {
+                let decl = types.get(ty_name.as_str())?;
+                decl.fields.iter().find(|field| field.name == *name)?.ty.as_ref()?
+            }
+            _ => return None,
+        };
+    }
+    if op == AssignOp::Add && let Some(inner) = ty.element() {
+        return Some(inner);
+    }
+    Some(ty)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,11 +242,19 @@ pub struct Expr {
 }
 
 #[derive(Debug)]
+pub struct NamedField {
+    pub name: String,
+    pub span: Span,
+    pub value: Expr,
+}
+
+#[derive(Debug)]
 pub enum ExprKind {
     Int(i64),
     Bool(bool),
     Str(Vec<StrPart>),
     Array(Vec<Expr>),
+    Record(Vec<NamedField>),
     Var(String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),

@@ -91,22 +91,35 @@ fn closest<'a>(name: &str, cands: impl Iterator<Item = &'a String>) -> Option<St
         .map(|(_, c)| c.clone())
 }
 
+fn unknown_type(ty: &TypeExpr, sp: Span, defs: &TypeDecls<'_>) -> Option<ZatuError> {
+    let name = match ty {
+        TypeExpr::Array(inner) => return unknown_type(inner, sp, defs),
+        TypeExpr::Named(name) => name,
+    };
+    if BASIC_TYPES.contains(&name.as_str()) || defs.contains_key(name.as_str()) {
+        return None;
+    }
+    let names: Vec<_> = BASIC_TYPES.iter().copied().chain(defs.keys().copied()).map(str::to_owned).collect();
+    let mut e = ZatuError::new(sp, format!("{name} という型はありません"));
+    if let Some(c) = closest(name, names.iter()) {
+        e = e.hint(format!("{c} のまちがいではありませんか？"));
+    }
+    Some(e)
+}
+
 pub fn check(prog: &Program) -> Vec<ZatuError> {
     let mut errs = Vec::new();
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for (name, min, max, returns) in BUILTINS {
         sigs.insert(name.to_string(), Sig { min: *min, max: *max, returns: *returns, kind: SigKind::Builtin });
     }
-    let mut type_names: HashSet<String> = BASIC_TYPES.iter().map(|s| s.to_string()).collect();
-
     for t in &prog.types {
-        if sigs.contains_key(&t.name) || type_names.contains(&t.name) {
+        if sigs.contains_key(&t.name) || BASIC_TYPES.contains(&t.name.as_str()) {
             errs.push(ZatuError::new(t.span, format!("{} という名前はもう使われています", t.name)));
             continue;
         }
         let n = t.fields.len();
         sigs.insert(t.name.clone(), Sig { min: n, max: n, returns: true, kind: SigKind::Type });
-        type_names.insert(t.name.clone());
         let mut seen = HashSet::new();
         for f in &t.fields {
             if !seen.insert(&f.name) {
@@ -115,7 +128,7 @@ pub fn check(prog: &Program) -> Vec<ZatuError> {
         }
     }
     for f in &prog.funcs {
-        if sigs.contains_key(&f.name) || type_names.contains(&f.name) {
+        if sigs.contains_key(&f.name) || BASIC_TYPES.contains(&f.name.as_str()) {
             errs.push(ZatuError::new(f.span, format!("{} という名前はもう使われています", f.name)));
             continue;
         }
@@ -142,23 +155,9 @@ pub fn check(prog: &Program) -> Vec<ZatuError> {
         }
     }
 
-    // 型の名前が存在するか
+    let defs: TypeDecls<'_> = prog.types.iter().map(|t| (t.name.as_str(), t)).collect();
     let check_ty = |ty: &Option<TypeExpr>, sp: Span, errs: &mut Vec<ZatuError>| {
-        let mut t = match ty {
-            Some(t) => t,
-            None => return,
-        };
-        while let TypeExpr::Array(inner) = t {
-            t = inner;
-        }
-        if let TypeExpr::Named(n) = t
-            && !type_names.contains(n) {
-                let mut e = ZatuError::new(sp, format!("{n} という型はありません"));
-                if let Some(c) = closest(n, type_names.iter()) {
-                    e = e.hint(format!("{c} のまちがいではありませんか？"));
-                }
-                errs.push(e);
-            }
+        errs.extend(ty.as_ref().and_then(|ty| unknown_type(ty, sp, &defs)));
     };
     for t in &prog.types {
         for f in &t.fields {
@@ -173,9 +172,9 @@ pub fn check(prog: &Program) -> Vec<ZatuError> {
     }
 
     let empty = HashSet::new();
-    let top = Scope::run(&sigs, &prog.body, &[], false, &empty, &mut errs);
+    let top = Scope::run(&sigs, &defs, &prog.body, &[], false, &empty, &mut errs);
     for f in &prog.funcs {
-        Scope::run(&sigs, &f.body, &f.params, true, &top, &mut errs);
+        Scope::run(&sigs, &defs, &f.body, &f.params, true, &top, &mut errs);
     }
 
     errs.sort_by_key(|e| (e.span.line, e.span.col));
@@ -185,6 +184,8 @@ pub fn check(prog: &Program) -> Vec<ZatuError> {
 /// 変数の有効範囲は関数単位。ループ変数だけはループの中だけで使える。
 struct Scope<'a> {
     sigs: &'a HashMap<String, Sig>,
+    defs: &'a TypeDecls<'a>,
+    variable_types: VariableTypes<'a>,
     in_func: bool,
     params: HashSet<String>,
     /// 名前 = 値 で作られる変数と、最初に作られた場所
@@ -229,7 +230,8 @@ fn collect(stmts: &[Stmt], loops: &mut Vec<String>, params: &HashSet<String>, ou
 impl<'a> Scope<'a> {
     fn run(
         sigs: &'a HashMap<String, Sig>,
-        body: &[Stmt],
+        defs: &'a TypeDecls<'a>,
+        body: &'a [Stmt],
         params: &[Param],
         in_func: bool,
         outer: &'a HashSet<String>,
@@ -237,6 +239,8 @@ impl<'a> Scope<'a> {
     ) -> HashSet<String> {
         let mut s = Scope {
             sigs,
+            defs,
+            variable_types: variable_types(body),
             in_func,
             params: HashSet::new(),
             assigned: HashMap::new(),
@@ -287,8 +291,9 @@ impl<'a> Scope<'a> {
 
     fn stmt(&mut self, s: &Stmt) {
         match &s.kind {
-            StmtKind::Assign { target, op, value } => {
-                self.expr(value);
+            StmtKind::Assign { target, annotation, op, value } => {
+                let expected = assignment_value_type(target, *op, &self.variable_types, self.defs);
+                self.expr_with_type(value, expected);
                 for a in &target.path {
                     if let Access::Index(e) = a {
                         self.expr(e);
@@ -307,6 +312,14 @@ impl<'a> Scope<'a> {
                 if self.sigs.contains_key(n) {
                     self.err(ZatuError::new(target.span, format!("{n} は関数の名前なので、変数の名前には使えません")));
                     return;
+                }
+                if let Some((ty, sp)) = annotation {
+                    self.errs.extend(unknown_type(ty, *sp, self.defs));
+                    if self.params.contains(n) {
+                        self.err(ZatuError::new(*sp, format!("引数 {n} の型は func の引数のところに書きます")));
+                    } else if let Some(first) = self.variable_types.get(n.as_str()) && *first != ty {
+                        self.err(ZatuError::new(*sp, format!("{n} の型は {} と書かれています", first.show())));
+                    }
                 }
                 let creates = target.path.is_empty() && *op == AssignOp::Set;
                 if !creates && !self.params.contains(n) && !self.assigned.contains_key(n) {
@@ -430,6 +443,10 @@ impl<'a> Scope<'a> {
     }
 
     fn expr(&mut self, e: &Expr) {
+        self.expr_with_type(e, None);
+    }
+
+    fn expr_with_type(&mut self, e: &Expr, expected: Option<&TypeExpr>) {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Bool(_) => {}
             ExprKind::Str(parts) => {
@@ -441,9 +458,10 @@ impl<'a> Scope<'a> {
             }
             ExprKind::Array(xs) => {
                 for x in xs {
-                    self.expr(x);
+                    self.expr_with_type(x, expected.and_then(TypeExpr::element));
                 }
             }
+            ExprKind::Record(fields) => self.record(fields, e.span, expected),
             ExprKind::Var(n) => {
                 if self.loops.contains(n) {
                 } else if self.params.contains(n) || self.assigned.contains_key(n) {
@@ -463,6 +481,55 @@ impl<'a> Scope<'a> {
             ExprKind::Index { recv, index } => {
                 self.expr(recv);
                 self.expr(index);
+            }
+        }
+    }
+
+    fn record(&mut self, fields: &[NamedField], span: Span, expected: Option<&TypeExpr>) {
+        let def = match expected {
+            Some(TypeExpr::Named(n)) => self.defs.get(n.as_str()).copied(),
+            _ => None,
+        };
+        let Some(def) = def else {
+            match expected {
+                None => self.err(ZatuError::new(span, "{ } でどの型の値を作るか分かりません")
+                    .hint("変数の名前のあとに型を書いてください（例: user: User = { ... }）")),
+                // 存在しない型は、型が書かれた場所で報告する。
+                Some(TypeExpr::Named(n)) if !BASIC_TYPES.contains(&n.as_str()) => {}
+                Some(ty) => self.err(ZatuError::new(span, format!(
+                    "ここには {} が入ります。{{ }} は項目を持つ型の値を作るときに使います", ty.show()
+                ))),
+            }
+            for field in fields {
+                self.expr(&field.value);
+            }
+            return;
+        };
+
+        let mut seen = HashSet::new();
+        let mut has_unknown = false;
+        for field in fields {
+            if !seen.insert(field.name.as_str()) {
+                self.err(ZatuError::new(field.span, format!("項目 {} が2回書かれています", field.name)));
+            }
+            let declared = def.fields.iter().find(|f| f.name == field.name);
+            if declared.is_none() {
+                has_unknown = true;
+                let mut e = ZatuError::new(field.span, format!("{} には {} という項目はありません", def.name, field.name));
+                if let Some(c) = closest(&field.name, def.fields.iter().map(|f| &f.name)) {
+                    e = e.hint(format!("{c} のまちがいではありませんか？"));
+                } else if !def.fields.is_empty() {
+                    let names: Vec<_> = def.fields.iter().map(|f| f.name.as_str()).collect();
+                    e = e.hint(format!("使える項目は {} です", names.join("、")));
+                }
+                self.err(e);
+            }
+            self.expr_with_type(&field.value, declared.and_then(|f| f.ty.as_ref()));
+        }
+        if !has_unknown {
+            let missing: Vec<_> = def.fields.iter().filter(|f| !seen.contains(f.name.as_str())).map(|f| f.name.as_str()).collect();
+            if !missing.is_empty() {
+                self.err(ZatuError::new(span, format!("{} を作るには {} の値が必要です", def.name, missing.join("、"))));
             }
         }
     }

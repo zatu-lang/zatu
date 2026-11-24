@@ -38,6 +38,7 @@ pub enum Tok {
     LBracket,
     RBracket,
     Comma,
+    Colon,
     Dot,
     DotDot,
     Assign,
@@ -88,6 +89,7 @@ pub fn describe(t: &Tok) -> String {
         Tok::LBracket => "[",
         Tok::RBracket => "]",
         Tok::Comma => ",",
+        Tok::Colon => ":",
         Tok::Dot => ".",
         Tok::DotDot => "..",
         Tok::Assign => "=",
@@ -398,6 +400,7 @@ impl Lexer {
             (':', Some('=')) => {
                 return Err(ZatuError::new(two, ":= は使いません").hint("zatu では = だけで変数を作れます（x = 1）"));
             }
+            (':', _) => Tok::Colon,
             ('!', _) => {
                 return Err(ZatuError::new(here, "! は使いません").hint("「〜ではない」は not を使います（not done）"));
             }

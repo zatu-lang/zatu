@@ -33,6 +33,9 @@ pub struct Interp<'p, 'io> {
     funcs: HashMap<&'p str, &'p FuncDecl>,
     returns: HashSet<&'p str>,
     types: HashMap<&'p str, Rc<TypeDef>>,
+    type_decls: TypeDecls<'p>,
+    top_types: Rc<VariableTypes<'p>>,
+    local_types: HashMap<&'p str, Rc<VariableTypes<'p>>>,
     out: &'io mut dyn Write,
     input: &'io mut dyn BufRead,
     depth: usize,
@@ -176,6 +179,9 @@ impl<'p, 'io> Interp<'p, 'io> {
     pub fn new(prog: &'p Program, out: &'io mut dyn Write, input: &'io mut dyn BufRead) -> Self {
         let funcs = prog.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
         let returns = prog.funcs.iter().filter(|f| returns_value(&f.body)).map(|f| f.name.as_str()).collect();
+        let type_decls = prog.types.iter().map(|t| (t.name.as_str(), t)).collect();
+        let top_types = Rc::new(variable_types(&prog.body));
+        let local_types = prog.funcs.iter().map(|f| (f.name.as_str(), Rc::new(variable_types(&f.body)))).collect();
         let types = prog
             .types
             .iter()
@@ -192,13 +198,13 @@ impl<'p, 'io> Interp<'p, 'io> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x2545F4914F6CDD1D);
-        Interp { prog, funcs, returns, types, out, input, depth: 0, rng: seed | 1 }
+        Interp { prog, funcs, returns, types, type_decls, top_types, local_types, out, input, depth: 0, rng: seed | 1 }
     }
 
     pub fn run(&mut self) -> R<()> {
         let prog = self.prog;
         let mut env = Env::new();
-        self.block(&prog.body, &mut env)?;
+        self.block(&prog.body, &mut env, &self.top_types.clone())?;
         let _ = self.out.flush();
         Ok(())
     }
@@ -213,9 +219,9 @@ impl<'p, 'io> Interp<'p, 'io> {
         x
     }
 
-    fn block(&mut self, ss: &[Stmt], env: &mut Env) -> R<Flow> {
+    fn block(&mut self, ss: &[Stmt], env: &mut Env, types: &VariableTypes<'p>) -> R<Flow> {
         for s in ss {
-            match self.stmt(s, env)? {
+            match self.stmt(s, env, types)? {
                 Flow::Normal => {}
                 f => return Ok(f),
             }
@@ -223,10 +229,11 @@ impl<'p, 'io> Interp<'p, 'io> {
         Ok(Flow::Normal)
     }
 
-    fn stmt(&mut self, s: &Stmt, env: &mut Env) -> R<Flow> {
+    fn stmt(&mut self, s: &Stmt, env: &mut Env, types: &VariableTypes<'p>) -> R<Flow> {
         match &s.kind {
-            StmtKind::Assign { target, op, value } => {
-                let v = self.eval(value, env)?;
+            StmtKind::Assign { target, op, value, .. } => {
+                let expected = assignment_value_type(target, *op, types, &self.type_decls);
+                let v = self.eval_with_type(value, expected, env)?;
                 self.assign(target, *op, v, value.span, env)?;
             }
             StmtKind::Expr(e) => {
@@ -235,9 +242,9 @@ impl<'p, 'io> Interp<'p, 'io> {
             StmtKind::If { cond, then, els } => {
                 let c = self.eval(cond, env)?;
                 if truth(&c, cond.span, "if の条件")? {
-                    return self.block(then, env);
+                    return self.block(then, env, types);
                 } else if let Some(e) = els {
-                    return self.block(e, env);
+                    return self.block(e, env, types);
                 }
             }
             StmtKind::ForIn { var, index, iter, body, .. } => {
@@ -256,7 +263,7 @@ impl<'p, 'io> Interp<'p, 'io> {
                     if let Some((iname, _)) = index {
                         env.insert(iname.clone(), Value::Int(i as i64 + 1));
                     }
-                    match self.block(body, env)? {
+                    match self.block(body, env, types)? {
                         Flow::Break => break,
                         Flow::Return(v) => {
                             result = Flow::Return(v);
@@ -278,7 +285,7 @@ impl<'p, 'io> Interp<'p, 'io> {
                         break;
                     }
                 }
-                match self.block(body, env)? {
+                match self.block(body, env, types)? {
                     Flow::Break => break,
                     Flow::Return(v) => return Ok(Flow::Return(v)),
                     Flow::Normal | Flow::Continue => {}
@@ -342,6 +349,52 @@ impl<'p, 'io> Interp<'p, 'io> {
         Ok(())
     }
 
+    fn eval_with_type(&mut self, e: &Expr, expected: Option<&TypeExpr>, env: &mut Env) -> R<Value> {
+        let Some(ty) = expected else { return self.eval(e, env) };
+        match (&e.kind, ty) {
+            (ExprKind::Record(fields), TypeExpr::Named(name)) => self.record(name, fields, e.span, env),
+            (ExprKind::Array(xs), TypeExpr::Array(inner)) => {
+                let mut values = Vec::with_capacity(xs.len());
+                for x in xs {
+                    values.push(self.eval_with_type(x, Some(inner), env)?);
+                }
+                Ok(Value::Array(Rc::new(values)))
+            }
+            _ => {
+                let value = self.eval(e, env)?;
+                if type_matches(&value, ty) {
+                    return Ok(value);
+                }
+                let message = match (ty, &value) {
+                    (TypeExpr::Array(inner), Value::Array(_)) => {
+                        format!("ここには {} が入ります。配列の中身を {} にそろえてください", ty.show(), inner.show())
+                    }
+                    _ => format!("ここには {} が入ります（今は{}）", ty.show(), value.kind_name()),
+                };
+                Err(err(e.span, message))
+            }
+        }
+    }
+
+    fn record(&mut self, name: &str, fields: &[NamedField], span: Span, env: &mut Env) -> R<Value> {
+        let def = self.types.get(name).cloned()
+            .ok_or_else(|| err(span, format!("{name} には名前で指定できる項目がありません")))?;
+        let mut values = vec![None; def.fields.len()];
+        // 式は書かれた順に実行し、値は型の項目順に格納する。
+        for field in fields {
+            let i = def.fields.iter().position(|n| n == &field.name)
+                .ok_or_else(|| err(field.span, format!("{name} には {} という項目はありません", field.name)))?;
+            if values[i].is_some() {
+                return Err(err(field.span, format!("項目 {} が2回書かれています", field.name)));
+            }
+            values[i] = Some(self.eval_with_type(&field.value, def.types[i].as_ref(), env)?);
+        }
+        let fields = values.into_iter().zip(&def.fields).map(|(v, field)| {
+            v.ok_or_else(|| err(span, format!("{name} を作るには {field} の値が必要です")))
+        }).collect::<R<Vec<_>>>()?;
+        Ok(Value::Struct(Rc::new(StructVal { def, fields })))
+    }
+
     fn eval(&mut self, e: &Expr, env: &mut Env) -> R<Value> {
         Ok(match &e.kind {
             ExprKind::Int(n) => Value::Int(*n),
@@ -365,6 +418,7 @@ impl<'p, 'io> Interp<'p, 'io> {
                 }
                 Value::Array(Rc::new(v))
             }
+            ExprKind::Record(_) => return Err(err(e.span, "{ } でどの型の値を作るか分かりません")),
             ExprKind::Var(n) => env
                 .get(n)
                 .cloned()
@@ -488,7 +542,8 @@ impl<'p, 'io> Interp<'p, 'io> {
                 env.insert(p.name.clone(), v);
             }
             self.depth += 1;
-            let flow = self.block(&f.body, &mut env);
+            let types = self.local_types[name].clone();
+            let flow = self.block(&f.body, &mut env, &types);
             self.depth -= 1;
             let v = match flow? {
                 Flow::Return(v) => v,

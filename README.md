@@ -7,16 +7,20 @@
 設計の考え方は [docs/言語設計.md](docs/言語設計.md) にあります。いまは v0（とりあえず動く版）で、文法はすべて仮決定です。
 
 ```zatu
-type User {
-    name string
-    age int
+type 人 {
+    名前 string
+    年齢 int
 }
 
-users = [User("ようかん", 7), User("たろう", 20)]
+みんな: []人 = [
+    { 名前: "ようかん", 年齢: 7 },
+    { 名前: "たろう", 年齢: 20 },
+    { 名前: "はなこ", 年齢: 18 },
+]
 
-for user at i in users {
-    if user.age >= 18 {
-        print("{i}: {user.name} はおとな")
+for ひと at 番号 in みんな {
+    if ひと.年齢 >= 18 {
+        print("{番号}: {ひと.名前} はおとな")
     }
 }
 ```

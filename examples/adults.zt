@@ -4,7 +4,11 @@ type User {
     age int
 }
 
-users = [User("ようかん", 7), User("たろう", 20), User("はなこ", 18)]
+users: []User = [
+    { name: "ようかん", age: 7 },
+    { name: "たろう", age: 20 },
+    { name: "はなこ", age: 18 },
+]
 
 adults = []
 for user in users {

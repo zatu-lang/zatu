@@ -67,6 +67,72 @@ print(xs, ys)
 }
 
 #[test]
+fn named_fields_use_the_assignment_type() {
+    let src = r#"
+type 人 {
+    名前 string
+    年齢 int
+}
+type 組 { みんな []人 }
+func 作る() 組 {
+    一人: 人 = {
+        年齢: 7,
+        名前: "ようかん",
+    }
+    結果: 組 = { みんな: [一人] }
+    結果.みんな += { 名前: "たろう", 年齢: 20 }
+    結果.みんな[1] = { 名前: 一人.名前, 年齢: 8 }
+    return 結果
+}
+組のみんな = 作る().みんな
+print(組のみんな[1].名前, 組のみんな[1].年齢, 組のみんな[2].名前)
+"#;
+    assert_eq!(ok(src), "ようかん 8 たろう\n");
+}
+
+#[test]
+fn array_annotations_survive_empty_assignments_and_nested_updates() {
+    assert_eq!(
+        ok("type User { age int }\nusers: []User = []\nusers += { age: 7 }\nprint(users[1].age)"),
+        "7\n"
+    );
+    for update in ["users += 7", "users = [7]", "users = 1..2"] {
+        let src = format!("type User {{ age int }}\nusers: []User = [User(1)]\nusers = []\n{update}\nprint(users)");
+        assert!(fails(&src).contains("User"), "{update}");
+    }
+    assert!(fails("rows: [][]int = [[]]\nrows[1] += \"a\"\nprint(rows)").contains("ここには int が入ります"));
+    assert!(fails("type User { age int }\nu: User = { age: \"7\" }\nprint(u)").contains("ここには int が入ります"));
+}
+
+#[test]
+fn named_field_typos_are_reported_before_running() {
+    let src = "type 人 { 年齢 int }\nprint(1)\n一人: 人 = { 年令: 7 }\nprint(一人)";
+    let mut out = Vec::new();
+    let Err(Failure::NotRun(errs)) = zatu::run(src, &mut out, &mut "".as_bytes()) else {
+        panic!("実行前にエラーになるはず");
+    };
+    assert!(out.is_empty());
+    assert_eq!(errs[0].span, zatu::ast::Span::new(3, 11, 2));
+    assert!(errs[0].msg.contains("年令 という項目はありません"));
+    assert!(errs[0].hint.as_deref().unwrap().contains("年齢 のまちがい"));
+}
+
+#[test]
+fn named_fields_require_a_known_type_and_each_field_once() {
+    let cases = [
+        ("user = { age: 7 }", "どの型の値を作るか分かりません"),
+        ("user: User = {}", "age の値が必要です"),
+        ("user: User = { age: 7, age: 8 }", "age が2回書かれています"),
+        ("user: Usre = User(7)", "Usre という型はありません"),
+        ("user: User = User(7)\nuser: int = 7", "user の型は User と書かれています"),
+    ];
+    for (assignment, message) in cases {
+        let error = fails(&format!("type User {{ age int }}\n{assignment}\nprint(user)"));
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[test]
 fn strings_count_characters() {
     assert_eq!(ok(r#"s = "ようかん"
 print(len(s), s[1], s[4])"#), "4 よ ん\n");

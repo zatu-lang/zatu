@@ -275,6 +275,22 @@ impl Parser {
             }
             _ => {
                 let e = self.expr()?;
+                if self.eat(&Tok::Colon) {
+                    let target = to_target(e)?;
+                    if !target.path.is_empty() {
+                        return Err(ZatuError::new(target.span, "型は変数の名前のあとに書きます")
+                            .hint("例: users: []User = []"));
+                    }
+                    let type_span = self.span();
+                    let ty = self.type_expr()?;
+                    let type_span = type_span.to(self.prev_span());
+                    self.expect(Tok::Assign, "=")?;
+                    let value = self.expr()?;
+                    return Ok(Stmt {
+                        kind: StmtKind::Assign { target, annotation: Some((ty, type_span)), op: AssignOp::Set, value },
+                        span,
+                    });
+                }
                 let op = match self.peek() {
                     Tok::Assign => Some(AssignOp::Set),
                     Tok::PlusAssign => Some(AssignOp::Add),
@@ -286,7 +302,7 @@ impl Parser {
                         self.advance();
                         let value = self.expr()?;
                         let target = to_target(e)?;
-                        StmtKind::Assign { target, op, value }
+                        StmtKind::Assign { target, annotation: None, op, value }
                     }
                     None => StmtKind::Expr(e),
                 }
@@ -535,6 +551,25 @@ impl Parser {
                 self.expect(Tok::RBracket, "]")?;
                 let span = sp.to(self.prev_span());
                 return Ok(Expr { kind: ExprKind::Array(xs), span });
+            }
+            Tok::LBrace => {
+                self.advance();
+                self.skip_newlines();
+                let mut fields = Vec::new();
+                while !self.at(&Tok::RBrace) {
+                    let (name, span) = self.ident("項目の名前")?;
+                    self.expect(Tok::Colon, ":")?;
+                    self.skip_newlines();
+                    let value = self.expr()?;
+                    fields.push(NamedField { name, span, value });
+                    self.skip_newlines();
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                    self.skip_newlines();
+                }
+                self.expect(Tok::RBrace, "}")?;
+                return Ok(Expr { kind: ExprKind::Record(fields), span: sp.to(self.prev_span()) });
             }
             _ => return Err(self.unexpected("値や式")),
         };
